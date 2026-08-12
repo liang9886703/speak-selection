@@ -1,0 +1,6 @@
+pyobjc-core
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+pyobjc-framework-ApplicationServices
+pyobjc-framework-AVFoundation
+rumps
