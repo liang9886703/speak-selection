@@ -32,6 +32,8 @@ from hotkey import HotkeyListener, HOTKEY_LABEL
 _READ_DELAY = 0.12
 # 单次朗读最大字符数，过长截断，避免长篇卡住
 _MAX_CHARS = 5000
+# 复制朗读：1s 内复制 ≥2 次，则第 2 次起视为“停止/打断”朗读
+_RAPID_COPY_WINDOW = 1.0
 
 
 class SpeakSelectionApp(rumps.App):
@@ -43,12 +45,21 @@ class SpeakSelectionApp(rumps.App):
         self._dragged = False
         self._last_text = ""
         self._last_ts = 0.0
+        self._last_copy_ts = 0.0  # 复制朗读模式下，上一次检测到复制的时刻
+        self._mode = "selection"  # "selection" 选中朗读 / "copy" 复制朗读
+        self._pb_change = None  # 复制模式下跟踪剪贴板变更计数
         # 单槽队列：保证只有一个后台线程读剪贴板（NSPasteboard 非线程安全）
         self._work_q = queue.Queue(maxsize=1)
 
         # ---- 菜单 ----
         self._pause_item = rumps.MenuItem("暂停自动朗读", callback=self._toggle_pause)
         self._stop_item = rumps.MenuItem("停止当前朗读", callback=self._stop_speaking)
+
+        self._mode_items = {}
+        for key, label in (("selection", "选中朗读"), ("copy", "复制朗读")):
+            item = rumps.MenuItem(label, callback=self._make_mode_cb(key))
+            item.state = 1 if key == self._mode else 0
+            self._mode_items[key] = item
 
         self._rate_items = {}
         for key, label in (("slow", "慢"), ("normal", "中"), ("fast", "快")):
@@ -64,6 +75,7 @@ class SpeakSelectionApp(rumps.App):
         self.menu = [
             self._pause_item,
             self._stop_item,
+            {"触发模式": list(self._mode_items.values())},
             {"语速": list(self._rate_items.values())},
             None,  # 分隔线
             self._autostart_item,
@@ -76,6 +88,10 @@ class SpeakSelectionApp(rumps.App):
         # 唯一的取词工作线程（串行，避免并发访问剪贴板崩溃）
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
+
+        # 复制朗读模式：主线程轮询剪贴板变更
+        self._pb_timer = rumps.Timer(self._poll_clipboard, 0.4)
+        self._pb_timer.start()
 
         # 必须持有 monitor 对象，否则回调可能被释放导致崩溃
         self._mouse_monitor = (
@@ -121,7 +137,7 @@ class SpeakSelectionApp(rumps.App):
         elif etype == NSEventTypeLeftMouseDragged:
             self._dragged = True
         elif etype == NSEventTypeLeftMouseUp:
-            if self._paused:
+            if self._paused or self._mode != "selection":
                 return
             # 只对「拖拽选择」或「双击/三击选词选行」取词
             qualifies = self._dragged or event.clickCount() >= 2
@@ -159,7 +175,60 @@ class SpeakSelectionApp(rumps.App):
         # AVSpeechSynthesizer 回到主线程调用
         AppHelper.callAfter(self._speaker.speak, text)
 
+    # ---------- 复制朗读：主线程轮询剪贴板 ----------
+    def _poll_clipboard(self, _timer):
+        if self._mode != "copy" or self._paused:
+            return
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+
+        pb = NSPasteboard.generalPasteboard()
+        cc = pb.changeCount()
+        # 首次进入复制模式时先建立基线，不朗读已有内容
+        if self._pb_change is None:
+            self._pb_change = cc
+            return
+        if cc == self._pb_change:
+            return
+        # changeCount 自上次轮询以来的增量：>=2 说明两次复制落在同一个轮询间隔内
+        delta = cc - self._pb_change
+        self._pb_change = cc
+
+        now = time.monotonic()
+        # 快速连续复制（1s 内 ≥2 次）：第 2 次起视为“停止/打断”当前朗读，不再朗读新内容。
+        # delta>=2 覆盖两次复制同处一个轮询窗口的情况；否则按距上次复制的间隔判定。
+        rapid = delta >= 2 or (now - self._last_copy_ts) < _RAPID_COPY_WINDOW
+        self._last_copy_ts = now
+        if rapid:
+            self._speaker.stop()
+            return
+
+        value = pb.stringForType_(NSPasteboardTypeString)
+        text = (str(value).strip() if value else "")
+        if not text:
+            return
+        if len(text) > _MAX_CHARS:
+            text = text[:_MAX_CHARS]
+
+        now = time.monotonic()
+        if text == self._last_text and (now - self._last_ts) < 1.5:
+            return
+        self._last_text = text
+        self._last_ts = now
+        self._speaker.speak(text)
+
     # ---------- 菜单回调 ----------
+    def _make_mode_cb(self, key):
+        def cb(_sender=None):
+            self._mode = key
+            for k, item in self._mode_items.items():
+                item.state = 1 if k == key else 0
+            if key == "copy":
+                # 重新建立剪贴板基线，避免朗读切换前的旧内容
+                self._pb_change = None
+            self._notify("触发模式：" + ("复制朗读" if key == "copy" else "选中朗读"))
+
+        return cb
+
     def _toggle_pause(self, _sender=None):
         self._paused = not self._paused
         self._pause_item.state = 1 if self._paused else 0
