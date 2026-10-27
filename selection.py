@@ -72,9 +72,8 @@ def _clipboard_selected_text() -> str:
     """回退方案：备份剪贴板 → 模拟 Cmd+C → 读取 → 恢复剪贴板。"""
     pb = NSPasteboard.generalPasteboard()
     saved = _snapshot_pasteboard(pb)
-    prev_change = pb.changeCount()
-
     pb.clearContents()
+    prev_change = pb.changeCount()
     _post_cmd_c()
 
     # 轮询等待复制写入（最多 ~0.35s），比固定 sleep 更稳。

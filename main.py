@@ -8,6 +8,7 @@ import faulthandler
 faulthandler.enable(all_threads=True)
 
 import queue
+import re
 import threading
 import time
 
@@ -17,38 +18,30 @@ from AppKit import (
     NSEventMaskLeftMouseDown,
     NSEventMaskLeftMouseUp,
     NSEventMaskLeftMouseDragged,
-    NSEventMaskKeyDown,
     NSEventTypeLeftMouseDown,
     NSEventTypeLeftMouseUp,
     NSEventTypeLeftMouseDragged,
-    NSEventModifierFlagCommand,
 )
 from PyObjCTools import AppHelper
 
 import selection
 import autostart
 from speaker import Speaker, RATES
-from hotkey import HotkeyListener, HOTKEY_LABEL
+from hotkey import HotkeyListener, HOTKEY_LABEL, READ_HOTKEY_LABEL
 
 # 取词前的稳定延迟（等选区/复制就绪）
 _READ_DELAY = 0.12
 # 单次朗读最大字符数，过长截断，避免长篇卡住
 _MAX_CHARS = 5000
-# 复制朗读：1s 内复制 ≥2 次，则第 2 次起视为“停止/打断”朗读
-_RAPID_COPY_WINDOW = 1.0
-# 按下复制/剪切键后，等待系统写入剪贴板再判定的延迟
-_COPY_SETTLE_DELAY = 0.15
-# c / x 的虚拟键码（US 布局）
-_KEYCODE_C = 8
-_KEYCODE_X = 7
-
+# 超过这么多单词就不朗读（只读短词/短语）
+_MAX_WORDS = 3
 # 复制图片/富文本时剪贴板里常见的不可见占位符（对象替换符、零宽字符等），
 # 需要剔除后再判空，否则会把“非文本”误当成文本朗读。
 _INVISIBLE_CHARS = "￼﻿​‌‍⁠\xa0"
 
 
 def _readable_text(value) -> str:
-    """把剪贴板字符串规整为“真正可读的文本”；无有效内容时返回 ""。"""
+    """把选中文字规整为“真正可读的文本”；无有效内容时返回 ""。"""
     if not value:
         return ""
     text = str(value)
@@ -61,6 +54,19 @@ def _readable_text(value) -> str:
     return text
 
 
+_CJK = re.compile(r"[一-鿿㐀-䶿]")
+
+
+def _word_count(text: str) -> int:
+    """按空白分词统计单词数。"""
+    return len(text.split())
+
+
+def _should_skip_speech(text: str) -> bool:
+    """超过 3 个单词，或含中文，则不朗读。"""
+    return _word_count(text) > _MAX_WORDS or _CJK.search(text) is not None
+
+
 class SpeakSelectionApp(rumps.App):
     def __init__(self):
         super().__init__("SpeakSelection", title="🗣️", quit_button="退出")
@@ -70,19 +76,20 @@ class SpeakSelectionApp(rumps.App):
         self._dragged = False
         self._last_text = ""
         self._last_ts = 0.0
-        self._last_copy_ts = 0.0  # 复制朗读模式下，上一次检测到复制的时刻
-        self._mode = "copy"  # "selection" 选中朗读 / "copy" 复制朗读（默认）
-        self._pb_change = None  # 复制模式下跟踪剪贴板变更计数
-        self._oneshot_timers = []  # 持有一次性定时器，避免被 GC
+        self._mode = "hotkey"  # 默认快捷键朗读，也可切换为选中自动朗读
+        self._generation = 0  # 使暂停、停止或切换模式前的取词任务失效
         # 单槽队列：保证只有一个后台线程读剪贴板（NSPasteboard 非线程安全）
         self._work_q = queue.Queue(maxsize=1)
 
         # ---- 菜单 ----
-        self._pause_item = rumps.MenuItem("暂停自动朗读", callback=self._toggle_pause)
+        self._pause_item = rumps.MenuItem(f"暂停朗读（{HOTKEY_LABEL}）", callback=self._toggle_pause)
         self._stop_item = rumps.MenuItem("停止当前朗读", callback=self._stop_speaking)
 
         self._mode_items = {}
-        for key, label in (("selection", "选中朗读"), ("copy", "复制朗读")):
+        for key, label in (
+            ("hotkey", f"快捷键朗读（{READ_HOTKEY_LABEL}）"),
+            ("selection", "选中朗读"),
+        ):
             item = rumps.MenuItem(label, callback=self._make_mode_cb(key))
             item.state = 1 if key == self._mode else 0
             self._mode_items[key] = item
@@ -115,10 +122,6 @@ class SpeakSelectionApp(rumps.App):
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
 
-        # 复制朗读模式：主线程轮询剪贴板变更
-        self._pb_timer = rumps.Timer(self._poll_clipboard, 0.4)
-        self._pb_timer.start()
-
         # 必须持有 monitor 对象，否则回调可能被释放导致崩溃
         self._mouse_monitor = (
             NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
@@ -129,32 +132,11 @@ class SpeakSelectionApp(rumps.App):
             )
         )
 
-        self._hotkey = HotkeyListener(self._toggle_pause_from_hotkey)
-        if not self._hotkey.start():
-            print("⚠️  暂停热键未启用（缺少辅助功能权限）")
-
-        # 复制朗读模式：监听 Cmd+C / Cmd+X 按键本身，
-        # 以便「按了复制键但没选中内容」也能等同暂停（停止当前朗读）。
-        self._key_monitor = (
-            NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-                NSEventMaskKeyDown, self._on_key_event
-            )
+        self._hotkey = HotkeyListener(
+            self._toggle_pause_from_hotkey, self._read_from_hotkey
         )
-
-    def _after(self, delay, fn):
-        """在主 run loop 上延迟执行一次 fn（NSPasteboard 需在主线程访问）。"""
-
-        def wrapped(timer):
-            timer.stop()
-            try:
-                self._oneshot_timers.remove(timer)
-            except ValueError:
-                pass
-            fn()
-
-        t = rumps.Timer(wrapped, delay)
-        self._oneshot_timers.append(t)
-        t.start()
+        if not self._hotkey.start():
+            print("⚠️  全局热键未启用（缺少辅助功能权限）")
 
     def _check_permission(self):
         try:
@@ -191,115 +173,52 @@ class SpeakSelectionApp(rumps.App):
             # 只对「拖拽选择」或「双击/三击选词选行」取词
             qualifies = self._dragged or event.clickCount() >= 2
             if qualifies:
-                # 投递给唯一的工作线程；若已有待处理任务则合并丢弃
-                try:
-                    self._work_q.put_nowait(True)
-                except queue.Full:
-                    pass
+                self._queue_selection("selection")
+
+    def _queue_selection(self, mode):
+        # 单槽队列合并尚未开始的取词请求。
+        try:
+            self._work_q.put_nowait((mode, self._generation))
+        except queue.Full:
+            pass
+
+    def _read_from_hotkey(self):
+        if self._paused or self._mode != "hotkey":
+            return
+        self._queue_selection("hotkey")
 
     def _worker_loop(self):
         while True:
-            self._work_q.get()  # 阻塞等待下一次选择事件
+            mode, generation = self._work_q.get()
             try:
-                self._process_selection()
+                self._process_selection(mode, generation)
             except Exception as e:
                 print("选择处理出错:", e)
 
-    def _process_selection(self):
+    def _process_selection(self, mode, generation):
         time.sleep(_READ_DELAY)
-        # 拖拽/多击手势才允许剪贴板回退，避免误触时刷屏
-        text = selection.get_selected_text(allow_clipboard=True)
+        if mode == "hotkey":
+            # 等用户松开修饰键，避免剪贴板回退时干扰模拟的 Cmd+C。
+            if not self._hotkey.wait_for_release():
+                return
+        if self._paused or self._mode != mode or self._generation != generation:
+            return
+        text = _readable_text(selection.get_selected_text(allow_clipboard=True))
+        AppHelper.callAfter(self._speak_selection, text, mode, generation)
+
+    def _speak_selection(self, text, mode, generation):
+        # 取词期间可能暂停、停止或切换模式；失效任务不能重新开始朗读。
+        if self._paused or self._mode != mode or self._generation != generation:
+            return
         if not text:
+            self._speaker.stop()
             return
-        if len(text) > _MAX_CHARS:
-            text = text[:_MAX_CHARS]
-
+        if _should_skip_speech(text):
+            return
+        text = text[:_MAX_CHARS]
         now = time.monotonic()
-        # 去重：同一段文字 1.5s 内不重复朗读（仅本线程访问，无需加锁）
-        if text == self._last_text and (now - self._last_ts) < 1.5:
-            return
-        self._last_text = text
-        self._last_ts = now
-
-        # AVSpeechSynthesizer 回到主线程调用
-        AppHelper.callAfter(self._speaker.speak, text)
-
-    # ---------- 复制朗读 ----------
-    def _on_key_event(self, event):
-        """复制模式下监听 Cmd+C / Cmd+X 按键本身。
-
-        目的：即使「按了复制键但没选中内容」（剪贴板不变），也能等同暂停。
-        全局 monitor 回调运行在主线程，可安全读 NSPasteboard。
-        """
-        if self._mode != "copy" or self._paused:
-            return
-        if not (event.modifierFlags() & NSEventModifierFlagCommand):
-            return
-        if event.keyCode() not in (_KEYCODE_C, _KEYCODE_X):
-            return
-        from AppKit import NSPasteboard
-
-        prev_cc = NSPasteboard.generalPasteboard().changeCount()
-        # 等系统把内容写入剪贴板后再判定
-        self._after(_COPY_SETTLE_DELAY, lambda: self._after_copy(prev_cc))
-
-    def _after_copy(self, prev_cc):
-        if self._mode != "copy" or self._paused:
-            return
-        from AppKit import NSPasteboard
-
-        pb = NSPasteboard.generalPasteboard()
-        cc = pb.changeCount()
-        if self._pb_change is None:
-            self._pb_change = prev_cc
-        if cc == prev_cc:
-            # 按了复制/剪切，但剪贴板没变 → 没选中任何内容 → 等同暂停
-            self._speaker.stop()
-            return
-        self._consume_clipboard(pb, cc, cc - self._pb_change)
-
-    def _poll_clipboard(self, _timer):
-        """兜底：捕捉非快捷键来源的复制（右键菜单、程序化复制等）。"""
-        if self._mode != "copy" or self._paused:
-            return
-        from AppKit import NSPasteboard
-
-        pb = NSPasteboard.generalPasteboard()
-        cc = pb.changeCount()
-        # 首次进入复制模式时先建立基线，不朗读已有内容
-        if self._pb_change is None:
-            self._pb_change = cc
-            return
-        if cc == self._pb_change:
-            return
-        self._consume_clipboard(pb, cc, cc - self._pb_change)
-
-    def _consume_clipboard(self, pb, cc, delta):
-        """处理一次剪贴板变更：有可读文本则朗读，空/非文本则等同暂停。
-
-        delta：本次相对上次已处理的 changeCount 增量，>=2 说明短时间内多次复制。
-        """
-        from AppKit import NSPasteboardTypeString
-
-        self._pb_change = cc  # 标记已处理，避免键盘路径与轮询重复朗读
-
-        text = _readable_text(pb.stringForType_(NSPasteboardTypeString))
-        if not text:
-            # 复制/剪切内容为空（或图片等非文本）→ 等同暂停：停止当前朗读。
-            self._speaker.stop()
-            return
-        if len(text) > _MAX_CHARS:
-            text = text[:_MAX_CHARS]
-
-        now = time.monotonic()
-        # 快速连续复制（1s 内 ≥2 次）：第 2 次起视为“停止/打断”，不再朗读新内容。
-        rapid = delta >= 2 or (now - self._last_copy_ts) < _RAPID_COPY_WINDOW
-        self._last_copy_ts = now
-        if rapid:
-            self._speaker.stop()
-            return
-
-        if text == self._last_text and (now - self._last_ts) < 1.5:
+        # 自动选中模式去重；主动按热键允许重复朗读同一段文字。
+        if mode == "selection" and text == self._last_text and now - self._last_ts < 1.5:
             return
         self._last_text = text
         self._last_ts = now
@@ -308,17 +227,16 @@ class SpeakSelectionApp(rumps.App):
     # ---------- 菜单回调 ----------
     def _make_mode_cb(self, key):
         def cb(_sender=None):
+            self._generation += 1
             self._mode = key
             for k, item in self._mode_items.items():
                 item.state = 1 if k == key else 0
-            if key == "copy":
-                # 重新建立剪贴板基线，避免朗读切换前的旧内容
-                self._pb_change = None
-            self._notify("触发模式：" + ("复制朗读" if key == "copy" else "选中朗读"))
+            self._notify("触发模式：" + ("快捷键朗读" if key == "hotkey" else "选中朗读"))
 
         return cb
 
     def _toggle_pause(self, _sender=None):
+        self._generation += 1
         self._paused = not self._paused
         self._pause_item.state = 1 if self._paused else 0
         if self._paused:
@@ -327,9 +245,10 @@ class SpeakSelectionApp(rumps.App):
     def _toggle_pause_from_hotkey(self):
         # 热键回调在主 run loop 线程，直接切换即可
         self._toggle_pause()
-        self._notify(f"自动朗读：{'已暂停' if self._paused else '已开启'}")
+        self._notify(f"朗读：{'已暂停' if self._paused else '已开启'}")
 
     def _stop_speaking(self, _sender=None):
+        self._generation += 1
         self._speaker.stop()
 
     def _make_rate_cb(self, key):
